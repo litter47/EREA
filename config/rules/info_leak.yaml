@@ -1,0 +1,21 @@
+verify_type: info_leak
+description: "Information leak verification rules - checks for sensitive data exposure"
+logic:
+  operator: AND
+  threshold: 0.5
+checks:
+  - name: exp_exit_code_zero
+    type: exit_code
+    params:
+      expected: 0
+    weight: 0.3
+  - name: shadow_readable
+    type: ssh_check
+    params:
+      check_name: shadow_readable
+    weight: 0.4
+  - name: sensitive_configs
+    type: ssh_check
+    params:
+      check_name: sensitive_configs
+    weight: 0.3

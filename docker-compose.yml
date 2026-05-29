@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  eva:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eva-agent
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config:/app/config:ro
+      - eva_uploads:/tmp/eva_uploads
+    env_file:
+      - .env
+    environment:
+      - EVA_HOST=0.0.0.0
+      - EVA_PORT=8000
+      - EVA_LOG_LEVEL=INFO
+      - EVA_TASK_TIMEOUT=300
+      - EVA_DOCKER_IMAGE=eva-runtime:latest
+      - EVA_UPLOAD_DIR=/tmp/eva_uploads
+    restart: unless-stopped
+
+volumes:
+  eva_uploads:

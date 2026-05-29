@@ -1,0 +1,21 @@
+verify_type: auth_bypass
+description: "Authentication bypass verification rules - checks for unauthorized access"
+logic:
+  operator: AND
+  threshold: 0.5
+checks:
+  - name: exp_exit_code_zero
+    type: exit_code
+    params:
+      expected: 0
+    weight: 0.3
+  - name: access_protected
+    type: ssh_check
+    params:
+      check_name: access_protected
+    weight: 0.4
+  - name: content_indicators
+    type: ssh_check
+    params:
+      check_name: content_indicators
+    weight: 0.3

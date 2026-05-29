@@ -1,0 +1,26 @@
+verify_type: priv_esc
+description: "Privilege escalation verification rules - checks for privilege changes"
+logic:
+  operator: AND
+  threshold: 0.5
+checks:
+  - name: exp_exit_code_zero
+    type: exit_code
+    params:
+      expected: 0
+    weight: 0.3
+  - name: current_user_root
+    type: ssh_check
+    params:
+      check_name: current_user
+    weight: 0.3
+  - name: sudo_access
+    type: ssh_check
+    params:
+      check_name: sudo_access
+    weight: 0.2
+  - name: uid_changed
+    type: ssh_check
+    params:
+      check_name: uid_changed
+    weight: 0.2

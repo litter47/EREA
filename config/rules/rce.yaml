@@ -1,0 +1,26 @@
+verify_type: rce
+description: "RCE verification rules - checks for code execution side effects on target"
+logic:
+  operator: AND
+  threshold: 0.5
+checks:
+  - name: exp_exit_code_zero
+    type: exit_code
+    params:
+      expected: 0
+    weight: 0.3
+  - name: file_side_effect
+    type: ssh_check
+    params:
+      check_name: file_side_effect
+    weight: 0.3
+  - name: process_running
+    type: ssh_check
+    params:
+      check_name: process_running
+    weight: 0.2
+  - name: network_listening
+    type: ssh_check
+    params:
+      check_name: network_listening
+    weight: 0.2
