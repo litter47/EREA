@@ -7,15 +7,13 @@ command output, exit code, and execution duration.
 from __future__ import annotations
 
 import asyncio
-import os
-import shutil
-import tempfile
+import io
+import tarfile
 import time
 from pathlib import Path
-from typing import Optional
 
 import docker
-from docker.errors import ContainerError, DockerException, ImageNotFound
+from docker.errors import DockerException, ImageNotFound
 
 from eva_agent.sandbox.image import ensure_runtime_image
 from eva_agent.task.models import ExpResult
@@ -24,10 +22,9 @@ from eva_agent.task.models import ExpResult
 class SandboxExecutor:
     """Execute exploit commands inside a disposable Docker sandbox.
 
-    The executor creates a temporary directory, copies the exploit file
-    into it, runs the specified command inside a container mounted at that
-    directory, collects stdout/stderr/exit-code/duration, and then cleans
-    up.
+    The executor creates a disposable container, copies the exploit file
+    into it, runs the specified command, collects stdout/stderr/exit-code
+    and duration, and then cleans up.
 
     Attributes:
         image_name: The Docker image tag to use for sandbox containers.
@@ -81,10 +78,10 @@ class SandboxExecutor:
     ) -> ExpResult:
         """Execute a command inside the sandboxed Docker container.
 
-        Copies the exploit file at *exp_file_path* into a temporary
-        directory (as ``exploit``), then runs *execute_cmd* via
-        ``sh -c`` inside the container.  Stdout, stderr, exit code, and
-        wall-clock duration are captured and returned as an ExpResult.
+        Copies the exploit file at *exp_file_path* into the container as
+        ``/exp/exploit``, then runs *execute_cmd* via ``sh -c`` inside
+        the container. Stdout, stderr, exit code, and wall-clock duration
+        are captured and returned as an ExpResult.
 
         Args:
             exp_file_path: Absolute or relative path to the exploit file.
@@ -105,13 +102,7 @@ class SandboxExecutor:
                     duration=0.0,
                 )
 
-        temp_dir: Optional[str] = None
-
         try:
-            # Create a temporary directory for the exploit file
-            temp_dir = tempfile.mkdtemp(prefix="eva_sandbox_")
-
-            # Copy the exploit file into the temp directory as "exploit"
             src_path = Path(exp_file_path).resolve()
             if not src_path.is_file():
                 return ExpResult(
@@ -121,13 +112,7 @@ class SandboxExecutor:
                     duration=0.0,
                 )
 
-            dest_path = Path(temp_dir) / "exploit"
-            shutil.copy2(str(src_path), str(dest_path))
-            os.chmod(str(dest_path), 0o755)
-
-            # Build the docker run command
             container_image = self.image_name
-            volume_bind = f"{temp_dir}:/exp"
             full_command = ["sh", "-c", execute_cmd]
 
             loop = asyncio.get_running_loop()
@@ -136,46 +121,54 @@ class SandboxExecutor:
             async def _run_container() -> ExpResult:
                 def _do_run() -> tuple[str, str, int]:
                     """Synchronous docker SDK call."""
-                    result = self._client.containers.run(
-                        image=container_image,
-                        command=full_command,
-                        volumes={temp_dir: {"bind": "/exp", "mode": "rw"}},
-                        working_dir="/exp",
-                        mem_limit="512m",
-                        nano_cpus=int(1 * 1e9),  # 1 CPU
-                        security_opt=["no-new-privileges"],
-                        network_mode="host",
-                        remove=True,
-                        stdout=True,
-                        stderr=True,
-                        detach=False,
-                    )
-                    if isinstance(result, bytes):
-                        return result.decode("utf-8", errors="replace"), "", 0
-                    # Container returned (output, logs) tuple
-                    return str(result), "", 0
+                    container = None
+                    try:
+                        container = self._client.containers.create(
+                            image=container_image,
+                            command=["sleep", str(self.timeout + 5)],
+                            working_dir="/exp",
+                            mem_limit="512m",
+                            nano_cpus=int(1 * 1e9),  # 1 CPU
+                            security_opt=["no-new-privileges"],
+                            network_mode="host",
+                        )
+                        container.start()
+                        container.exec_run("mkdir -p /exp")
+                        container.put_archive(
+                            "/exp",
+                            self._build_exploit_archive(src_path),
+                        )
+                        container.exec_run("chmod 755 /exp/exploit")
+                        result = container.exec_run(
+                            full_command,
+                            stdout=True,
+                            stderr=True,
+                        )
+                        output = (
+                            result.output.decode(
+                                "utf-8", errors="replace"
+                            )
+                            if result.output
+                            else ""
+                        )
+                        exit_code = (
+                            result.exit_code
+                            if result.exit_code is not None
+                            else -1
+                        )
+                        return output, "", exit_code
+                    finally:
+                        if container is not None:
+                            try:
+                                container.remove(force=True)
+                            except Exception:
+                                pass
 
                 try:
                     stdout_text, stderr_text, exit_code = await loop.run_in_executor(
                         None,
                         _do_run,
                     )
-                except ContainerError as exc:
-                    exit_code = exc.exit_status
-                    stdout_text = (
-                        exc.stderr.decode("utf-8", errors="replace")
-                        if isinstance(exc.stderr, bytes)
-                        else str(exc.stderr or "")
-                    )
-                    stderr_text = ""
-                    # ContainerError may contain stdout as well
-                    if exc.container:
-                        try:
-                            logs = exc.container.logs(stdout=True, stderr=False)
-                            if logs:
-                                stdout_text = logs.decode("utf-8", errors="replace")
-                        except Exception:
-                            pass
                 except ImageNotFound as exc:
                     return ExpResult(
                         stdout="",
@@ -226,19 +219,16 @@ class SandboxExecutor:
                 exit_code=-1,
                 duration=0.0,
             )
-        finally:
-            # Cleanup temporary directory
-            if temp_dir is not None:
-                await self._cleanup_temp_dir(temp_dir)
 
-    async def _cleanup_temp_dir(self, path: str) -> None:
-        """Remove a temporary directory recursively.
-
-        Args:
-            path: Filesystem path to the directory to remove.
-        """
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, shutil.rmtree, path, True)
-        except Exception:
-            pass  # best-effort cleanup
+    @staticmethod
+    def _build_exploit_archive(src_path: Path) -> bytes:
+        """Create a tar archive suitable for Docker put_archive()."""
+        data = src_path.read_bytes()
+        tar_stream = io.BytesIO()
+        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+            info = tarfile.TarInfo(name="exploit")
+            info.size = len(data)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(data))
+        tar_stream.seek(0)
+        return tar_stream.getvalue()

@@ -1,6 +1,6 @@
 provider: openai
-base_url: https://api.openai.com/v1
+base_url: https://api.deepseek.com
 api_key: ""
-model: gpt-4.1
+model: deepseek-reasoner
 temperature: 0
-enabled: false
+enabled: true
