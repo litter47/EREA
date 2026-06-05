@@ -45,3 +45,16 @@ class LLMClient(ABC):
             An ``LLMJudgment`` instance with the LLM's evaluation.
         """
         ...
+
+    async def generate_rules(
+        self,
+        task_context: dict[str, Any],
+        exploit_content: str,
+    ) -> dict[str, Any]:
+        """Generate structured verification rules for an exploit.
+
+        Implementations should return a JSON-like dict. The caller is
+        responsible for normalising and validating the checks before any
+        remote verification is executed.
+        """
+        raise NotImplementedError

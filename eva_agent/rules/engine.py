@@ -5,13 +5,16 @@ collected evidence and produces a ``RuleScore``.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from eva_agent.task.models import RuleScore
 
 logger = logging.getLogger(__name__)
 
-_CHECK_TYPES = frozenset({"exit_code", "ssh_check", "content_match"})
+_CHECK_TYPES = frozenset(
+    {"exit_code", "ssh_check", "content_match", "content_regex"}
+)
 
 
 class RuleEngine:
@@ -111,6 +114,35 @@ class RuleEngine:
         )
         return False
 
+    @staticmethod
+    def _evaluate_content_regex(evidence: list[dict], params: dict) -> bool:
+        """Search stdout/stderr using regular expressions."""
+        patterns: list[str] = params.get("patterns", [])
+        if not patterns:
+            logger.warning("content_regex check has no patterns to search")
+            return False
+
+        texts: list[str] = []
+        for item in evidence:
+            if item.get("type") == "exp_execution":
+                data = item.get("data", {})
+                texts.append(data.get("stdout", ""))
+                texts.append(data.get("stderr", ""))
+
+        combined = "\n".join(texts)
+        for pattern in patterns:
+            try:
+                if re.search(pattern, combined, flags=re.IGNORECASE | re.MULTILINE):
+                    logger.debug("content_regex matched pattern: %s", pattern)
+                    return True
+            except re.error:
+                logger.warning("Invalid content_regex pattern: %s", pattern)
+
+        logger.debug(
+            "content_regex: none of %d patterns matched", len(patterns)
+        )
+        return False
+
     def evaluate(
         self, evidence: list[dict], rules: dict[str, Any]
     ) -> RuleScore:
@@ -177,6 +209,9 @@ class RuleEngine:
 
             elif check_type == "content_match":
                 passed = self._evaluate_content_match(evidence, params)
+
+            elif check_type == "content_regex":
+                passed = self._evaluate_content_regex(evidence, params)
 
             results.append((name, passed, weight))
             total_weight += weight

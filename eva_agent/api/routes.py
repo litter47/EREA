@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -45,6 +46,7 @@ async def submit_exploit(
     ssh_key: Optional[str] = Form(None, description="SSH private key content (alternative to password)"),
     verify_backend: VerifyBackend = Form(VerifyBackend.ssh, description="Verification backend: ssh, docker, winrm, or http"),
     container_name: Optional[str] = Form(None, description="Docker container name (required when verify_backend=docker)"),
+    generate_rules_with_llm: bool = Form(False, description="Generate verification rules with the configured LLM before falling back to YAML rules"),
     settings: Settings = Depends(get_settings),
     manager: TaskManager = Depends(get_task_manager),
 ) -> SubmitResponse:
@@ -70,6 +72,7 @@ async def submit_exploit(
     upload_subdir = os.path.join(settings.upload_dir, task_id)
     os.makedirs(upload_subdir, exist_ok=True)
     destination = os.path.join(upload_subdir, "exploit")
+    source_language = _detect_source_language(exploit_file.filename)
 
     try:
         content = await exploit_file.read()
@@ -96,7 +99,12 @@ async def submit_exploit(
         "verify_type": verify_type.value,
         "verify_backend": verify_backend.value,
         "ssh_user": ssh_user,
+        "generate_rules_with_llm": generate_rules_with_llm,
     }
+    if source_language is not None:
+        request["source_language"] = source_language
+    if exploit_file.filename is not None:
+        request["original_filename"] = exploit_file.filename
     if ssh_password is not None:
         request["ssh_password"] = ssh_password
     if ssh_key is not None:
@@ -186,3 +194,13 @@ def _task_result_to_dict(result: TaskResult) -> dict:
         if value is not None:
             cleaned[key] = value
     return cleaned
+
+
+def _detect_source_language(filename: str | None) -> str | None:
+    """Infer source language from the uploaded filename extension."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix == ".c":
+        return "c"
+    if suffix in {".cc", ".cpp", ".cxx", ".c++"}:
+        return "cpp"
+    return None

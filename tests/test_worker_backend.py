@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from eva_agent.config.settings import Settings
-from eva_agent.task.models import Task, TaskResult, TaskStatus
+from eva_agent.task.models import ExpResult, Task, TaskResult, TaskStatus
 from eva_agent.task.worker import ExecutionWorker
 
 
@@ -215,3 +215,78 @@ class TestWorkerBackendRouting:
             # Should have called get_backend twice: once for "nonexistent",
             # then fallback to "ssh"
             assert mock_get_backend.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_worker_uses_generated_rules_when_requested(
+        self, worker_settings: Settings, tmp_path
+    ) -> None:
+        """LLM-generated rules are used instead of YAML verifier checks."""
+        exploit_path = tmp_path / "exploit"
+        exploit_path.write_text("int main(){return 0;}", encoding="utf-8")
+        task = _make_task(verify_backend="ssh")
+        task.file_path = str(exploit_path)
+        task.request["execute_cmd"] = "auto"
+        task.request["source_language"] = "c"
+        task.request["generate_rules_with_llm"] = True
+
+        generated_rules = {
+            "logic": {"operator": "AND"},
+            "checks": [
+                {
+                    "name": "marker_created",
+                    "type": "file_exists",
+                    "path": "/tmp/generated-marker",
+                }
+            ],
+        }
+
+        with patch(
+            "eva_agent.task.worker.SandboxExecutor"
+        ) as MockExec, patch(
+            "eva_agent.task.worker.get_backend"
+        ) as mock_get_backend, patch(
+            "eva_agent.task.worker.load_llm_config"
+        ) as mock_llm_config, patch(
+            "eva_agent.task.worker.LLMClientFactory.create"
+        ) as mock_create_llm:
+
+            mock_llm_config.return_value = MagicMock(enabled=True)
+            mock_llm = AsyncMock()
+            mock_llm.generate_rules = AsyncMock(return_value=generated_rules)
+            mock_llm.judge = AsyncMock(
+                return_value=MagicMock(
+                    success=False, confidence=0.0, reasoning=""
+                )
+            )
+            mock_create_llm.return_value = mock_llm
+
+            mock_exec = MockExec.return_value
+            mock_exec.ensure_image = AsyncMock(return_value=True)
+            mock_exec.execute = AsyncMock(
+                return_value=ExpResult(
+                    stdout="ok", stderr="", exit_code=0, duration=0.1
+                )
+            )
+
+            mock_backend = AsyncMock()
+            mock_backend.backend_type = "ssh"
+            mock_backend.connect = AsyncMock(return_value="session")
+            mock_backend.verify = AsyncMock(return_value=[])
+            mock_backend.disconnect = AsyncMock(return_value=None)
+            mock_backend.run = AsyncMock(return_value=("", "", 0))
+            mock_get_backend.return_value = mock_backend
+
+            worker = ExecutionWorker(worker_settings, config_dir="config")
+            await worker.run(task)
+
+            mock_exec.execute.assert_called_once_with(
+                str(exploit_path),
+                "auto",
+                source_language="c",
+            )
+            mock_backend.verify.assert_not_called()
+            mock_backend.run.assert_called_once()
+            assert task.result is not None
+            assert task.result.final_verdict == "SUCCESS"
+            assert task.result.rule_score is not None
+            assert task.result.rule_score.matched_rules == ["marker_created"]

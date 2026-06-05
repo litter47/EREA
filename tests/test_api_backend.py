@@ -59,6 +59,7 @@ class TestBackendSubmitFields:
             call_args = manager.submit.call_args[0]
             task = call_args[0]
             assert task.request["verify_backend"] == "ssh"
+            assert task.request["generate_rules_with_llm"] is False
 
     def test_submit_with_docker_backend(self) -> None:
         client, manager = _make_client()
@@ -146,6 +147,35 @@ class TestBackendSubmitFields:
             call_args = manager.submit.call_args[0]
             task = call_args[0]
             assert task.request["verify_backend"] == "http"
+
+    def test_submit_with_llm_rule_generation_flag(self) -> None:
+        client, manager = _make_client()
+        with patch("os.makedirs"), patch(
+            "uuid.uuid4", return_value="test-llm-rules"
+        ), patch("builtins.open", MagicMock()):
+            resp = client.post(
+                "/submit",
+                data={
+                    "execute_cmd": "auto",
+                    "target_ip": "10.0.0.1",
+                    "target_port": "22",
+                    "verify_type": "rce",
+                    "ssh_user": "root",
+                    "generate_rules_with_llm": "true",
+                },
+                files={
+                    "exploit_file": (
+                        "exp.cpp",
+                        b"#include <iostream>\nint main(){return 0;}",
+                        "text/x-c++src",
+                    )
+                },
+            )
+            assert resp.status_code == 202
+            call_args = manager.submit.call_args[0]
+            task = call_args[0]
+            assert task.request["generate_rules_with_llm"] is True
+            assert task.request["source_language"] == "cpp"
 
     def test_submit_invalid_backend_rejected(self) -> None:
         client, manager = _make_client()

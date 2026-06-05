@@ -53,6 +53,40 @@ class TestSubmit:
         assert task.request["target_port"] == 22
         assert task.request["verify_type"] == "rce"
         assert task.request["ssh_user"] == "root"
+        assert task.request["generate_rules_with_llm"] is False
+
+    @patch("builtins.open", new_callable=mock_open)
+    @patch("os.makedirs")
+    @patch("uuid.uuid4", return_value="mocked-task-uuid-c")
+    def test_submit_c_source_detection(
+        self, mock_uuid, mock_makedirs, mock_file, client, mock_task_manager
+    ):
+        """C/C++ uploads are marked for automatic source compilation."""
+        response = client.post(
+            "/submit",
+            data={
+                "execute_cmd": "auto",
+                "target_ip": "192.168.1.100",
+                "target_port": 22,
+                "verify_type": "rce",
+                "ssh_user": "root",
+                "generate_rules_with_llm": "true",
+            },
+            files={
+                "exploit_file": (
+                    "exploit.c",
+                    b"#include <stdio.h>\nint main(){puts(\"ok\");}",
+                    "text/x-c",
+                )
+            },
+        )
+
+        assert response.status_code == 202
+        task = mock_task_manager.get("mocked-task-uuid-c")
+        assert task is not None
+        assert task.request["source_language"] == "c"
+        assert task.request["original_filename"] == "exploit.c"
+        assert task.request["generate_rules_with_llm"] is True
 
     def test_submit_missing_fields(self, client):
         """Submit without required fields -> 422 validation error."""

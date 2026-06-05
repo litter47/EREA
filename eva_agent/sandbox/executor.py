@@ -75,6 +75,7 @@ class SandboxExecutor:
         self,
         exp_file_path: str,
         execute_cmd: str,
+        source_language: str | None = None,
     ) -> ExpResult:
         """Execute a command inside the sandboxed Docker container.
 
@@ -86,6 +87,8 @@ class SandboxExecutor:
         Args:
             exp_file_path: Absolute or relative path to the exploit file.
             execute_cmd: Shell command to run inside the container.
+            source_language: Optional source language hint. ``"c"`` and
+                ``"cpp"`` trigger an in-container build step before run.
 
         Returns:
             An ExpResult containing the command output, exit code, and
@@ -113,7 +116,9 @@ class SandboxExecutor:
                 )
 
             container_image = self.image_name
-            full_command = ["sh", "-c", execute_cmd]
+            build_cmd = self._build_command(source_language)
+            run_command = self._run_command(execute_cmd, source_language)
+            full_command = ["sh", "-c", run_command]
 
             loop = asyncio.get_running_loop()
             start_time = time.monotonic()
@@ -139,18 +144,35 @@ class SandboxExecutor:
                             self._build_exploit_archive(src_path),
                         )
                         container.exec_run("chmod 755 /exp/exploit")
+                        if build_cmd is not None:
+                            build_result = container.exec_run(
+                                ["sh", "-c", build_cmd],
+                                stdout=True,
+                                stderr=True,
+                            )
+                            build_output = self._decode_exec_output(
+                                build_result.output
+                            )
+                            build_exit = (
+                                build_result.exit_code
+                                if build_result.exit_code is not None
+                                else -1
+                            )
+                            if build_exit != 0:
+                                return (
+                                    build_output,
+                                    (
+                                        "Build failed for "
+                                        f"{source_language or 'source'} source."
+                                    ),
+                                    build_exit,
+                                )
                         result = container.exec_run(
                             full_command,
                             stdout=True,
                             stderr=True,
                         )
-                        output = (
-                            result.output.decode(
-                                "utf-8", errors="replace"
-                            )
-                            if result.output
-                            else ""
-                        )
+                        output = self._decode_exec_output(result.output)
                         exit_code = (
                             result.exit_code
                             if result.exit_code is not None
@@ -232,3 +254,31 @@ class SandboxExecutor:
             tar.addfile(info, io.BytesIO(data))
         tar_stream.seek(0)
         return tar_stream.getvalue()
+
+    @staticmethod
+    def _build_command(source_language: str | None) -> str | None:
+        """Return the compile command for source uploads, if needed."""
+        language = (source_language or "").lower()
+        if language == "c":
+            return "gcc -x c /exp/exploit -o /exp/exploit_bin"
+        if language in {"cpp", "c++"}:
+            return "g++ -x c++ /exp/exploit -o /exp/exploit_bin"
+        return None
+
+    @staticmethod
+    def _run_command(execute_cmd: str, source_language: str | None) -> str:
+        """Choose the runtime command after optional source compilation."""
+        command = (execute_cmd or "").strip()
+        if (source_language or "").lower() in {"c", "cpp", "c++"} and (
+            not command or command.lower() == "auto"
+        ):
+            return "/exp/exploit_bin"
+        return command
+
+    @staticmethod
+    def _decode_exec_output(output: bytes | str | None) -> str:
+        if output is None:
+            return ""
+        if isinstance(output, bytes):
+            return output.decode("utf-8", errors="replace")
+        return str(output)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 from typing import Any, Optional
 
 from eva_agent.config.settings import Settings
@@ -27,6 +28,7 @@ from eva_agent.llm.client import LLMClient
 from eva_agent.llm.config import load_llm_config
 from eva_agent.llm.factory import LLMClientFactory
 from eva_agent.report.generator import ReportGenerator
+from eva_agent.rules.dynamic import normalize_generated_rules
 from eva_agent.rules.engine import RuleEngine
 from eva_agent.rules.loader import RuleLoader
 from eva_agent.sandbox.executor import SandboxExecutor
@@ -156,6 +158,7 @@ class ExecutionWorker:
         rules: dict[str, Any] = {}
         rule_score: Optional[RuleScore] = None
         llm_judgment: Optional[LLMJudgment] = None
+        using_generated_rules = False
 
         try:
             # ----------------------------------------------------------
@@ -175,11 +178,14 @@ class ExecutionWorker:
             # 2. Execute exploit in sandbox
             # ----------------------------------------------------------
             execute_cmd: str = task.request.get("execute_cmd", "")
+            source_language: Optional[str] = task.request.get("source_language")
             logger.info(
                 "Executing EXP for task %s: %s", task.id, execute_cmd
             )
             exp_result = await self.sandbox_executor.execute(
-                task.file_path, execute_cmd
+                task.file_path,
+                execute_cmd,
+                source_language=source_language,
             )
             logger.info(
                 "EXP execution completed for task %s: "
@@ -206,6 +212,36 @@ class ExecutionWorker:
             container_name: Optional[str] = task.request.get(
                 "container_name"
             )
+            generate_rules_with_llm = bool(
+                task.request.get("generate_rules_with_llm", False)
+            )
+
+            # ----------------------------------------------------------
+            # 4. Generate or load verification rules
+            # ----------------------------------------------------------
+            if generate_rules_with_llm:
+                rules = await self._generate_rules_with_llm(
+                    task=task,
+                    verify_type=verify_type,
+                )
+                using_generated_rules = bool(rules.get("checks"))
+
+            if not using_generated_rules:
+                logger.info(
+                    "Loading rules (type=%s) for task %s ...",
+                    verify_type,
+                    task.id,
+                )
+                try:
+                    rules = self.rule_loader.load_rules(verify_type)
+                except FileNotFoundError:
+                    logger.warning(
+                        "No rule file found for verify_type=%s "
+                        "(task %s). Using empty rules.",
+                        verify_type,
+                        task.id,
+                    )
+                    rules = {"checks": [], "logic": {"operator": "AND"}}
 
             backend: Optional[VerificationBackend] = None
             try:
@@ -221,7 +257,7 @@ class ExecutionWorker:
                 backend = get_backend("ssh")
 
             # ----------------------------------------------------------
-            # 4. Build target dict and connect via selected backend
+            # 5. Build target dict and connect via selected backend
             # ----------------------------------------------------------
             target: dict = {
                 "host": target_ip,
@@ -252,14 +288,26 @@ class ExecutionWorker:
                     verify_backend,
                     task.id,
                 )
-                # Pass target_ip/port as evidence for auth_bypass verifier
-                verification_evidence = {
-                    "target_ip": target_ip,
-                    "target_port": target_port,
-                }
-                ssh_checks = await backend.verify(
-                    session, verify_type, verification_evidence
+                if using_generated_rules:
+                    ssh_checks = []
+                else:
+                    # Pass target_ip/port as evidence for auth_bypass verifier
+                    verification_evidence = {
+                        "target_ip": target_ip,
+                        "target_port": target_port,
+                    }
+                    ssh_checks = await backend.verify(
+                        session, verify_type, verification_evidence
+                    )
+                generated_probe_checks = await self._run_generated_probes(
+                    backend=backend,
+                    session=session,
+                    rules=rules,
+                    target_ip=target_ip,
+                    target_port=target_port,
                 )
+                if generated_probe_checks:
+                    ssh_checks.extend(generated_probe_checks)
                 logger.info(
                     "Verification complete for task %s (%s backend): "
                     "%d/%d checks passed",
@@ -288,7 +336,7 @@ class ExecutionWorker:
                         )
 
             # ----------------------------------------------------------
-            # 5. Build structured evidence
+            # 6. Build structured evidence
             # ----------------------------------------------------------
             logger.info("Building evidence for task %s ...", task.id)
             evidence = await self.evidence_builder.build(
@@ -297,25 +345,6 @@ class ExecutionWorker:
                 verify_type=verify_type,
                 task_request=task.request,
             )
-
-            # ----------------------------------------------------------
-            # 6. Load verification rules
-            # ----------------------------------------------------------
-            logger.info(
-                "Loading rules (type=%s) for task %s ...",
-                verify_type,
-                task.id,
-            )
-            try:
-                rules = self.rule_loader.load_rules(verify_type)
-            except FileNotFoundError:
-                logger.warning(
-                    "No rule file found for verify_type=%s "
-                    "(task %s). Using empty rules.",
-                    verify_type,
-                    task.id,
-                )
-                rules = {"checks": [], "logic": {"operator": "AND"}}
 
             # ----------------------------------------------------------
             # 7. Evaluate rules against evidence
@@ -357,6 +386,7 @@ class ExecutionWorker:
                 exp_result=exp_result,
                 ssh_checks=ssh_checks,
                 llm_judgment=llm_judgment,
+                strict_rule_verdict=using_generated_rules,
             )
 
             # ----------------------------------------------------------
@@ -412,6 +442,7 @@ class ExecutionWorker:
         exp_result: Optional[ExpResult],
         ssh_checks: list[SSHCheck],
         llm_judgment: Optional[LLMJudgment],
+        strict_rule_verdict: bool = False,
     ) -> str:
         """Determine the final verdict based on all pipeline results.
 
@@ -432,6 +463,10 @@ class ExecutionWorker:
                 rule_score.score,
             )
             return "SUCCESS"
+
+        if strict_rule_verdict:
+            logger.debug("Verdict: FAIL (generated rules did not pass)")
+            return "FAIL"
 
         if (
             exp_result is not None
@@ -455,3 +490,220 @@ class ExecutionWorker:
 
         logger.debug("Verdict: FAIL (no success condition met)")
         return "FAIL"
+
+    async def _generate_rules_with_llm(
+        self,
+        task: Task,
+        verify_type: str,
+    ) -> dict[str, Any]:
+        """Generate a constrained rule set with the configured LLM."""
+        if self.llm_client is None:
+            logger.warning(
+                "Task %s requested LLM rule generation, but no LLM client "
+                "is configured. Falling back to YAML rules.",
+                task.id,
+            )
+            return {"checks": [], "logic": {"operator": "AND"}}
+
+        exploit_content = self._read_exploit_text(task.file_path)
+        task_context = {
+            "verify_type": verify_type,
+            "execute_cmd": task.request.get("execute_cmd", ""),
+            "target_ip": task.request.get("target_ip", ""),
+            "target_port": task.request.get("target_port", 0),
+            "source_language": task.request.get("source_language"),
+            "original_filename": task.request.get("original_filename"),
+        }
+
+        try:
+            raw_rules = await self.llm_client.generate_rules(
+                task_context=task_context,
+                exploit_content=exploit_content,
+            )
+        except Exception:
+            logger.warning(
+                "LLM rule generation failed for task %s; falling back to YAML.",
+                task.id,
+                exc_info=True,
+            )
+            return {"checks": [], "logic": {"operator": "AND"}}
+
+        rules = normalize_generated_rules(raw_rules, verify_type=verify_type)
+        logger.info(
+            "Generated %d constrained rule check(s) for task %s",
+            len(rules.get("checks", [])),
+            task.id,
+        )
+        return rules
+
+    @staticmethod
+    def _read_exploit_text(file_path: str, limit: int = 12000) -> str:
+        """Read uploaded exploit text for rule planning, best effort."""
+        try:
+            with open(file_path, "rb") as fh:
+                data = fh.read(limit)
+        except OSError:
+            return ""
+        return data.decode("utf-8", errors="replace")
+
+    async def _run_generated_probes(
+        self,
+        backend: VerificationBackend,
+        session: Any,
+        rules: dict[str, Any],
+        target_ip: str = "",
+        target_port: int = 80,
+    ) -> list[SSHCheck]:
+        """Run dynamic probes embedded in generated rules."""
+        checks: list[SSHCheck] = []
+        for check in rules.get("checks", []):
+            if not isinstance(check, dict):
+                continue
+            probe = check.get("probe")
+            if not isinstance(probe, dict):
+                continue
+
+            check_name = str(
+                probe.get(
+                    "check_name",
+                    check.get("params", {}).get(
+                        "check_name", check.get("name", "generated_probe")
+                    ),
+                )
+            )
+            result = await self._run_single_probe(
+                backend=backend,
+                session=session,
+                check_name=check_name,
+                probe=probe,
+                target_ip=target_ip,
+                target_port=target_port,
+            )
+            checks.append(result)
+        return checks
+
+    async def _run_single_probe(
+        self,
+        backend: VerificationBackend,
+        session: Any,
+        check_name: str,
+        probe: dict[str, Any],
+        target_ip: str = "",
+        target_port: int = 80,
+    ) -> SSHCheck:
+        probe_type = str(probe.get("type", "")).lower()
+
+        if backend.backend_type == "http" and probe_type not in {
+            "http_body_contains",
+            "http_status",
+        }:
+            return SSHCheck(
+                check_name=check_name,
+                passed=False,
+                details=f"Probe type '{probe_type}' requires command execution.",
+            )
+
+        if probe_type == "file_exists":
+            path = str(probe.get("path", ""))
+            cmd = f"test -f {shlex.quote(path)}"
+            stdout, stderr, exit_code = await backend.run(session, cmd)
+            passed = exit_code == 0
+            details = (
+                f"File exists: {path}"
+                if passed
+                else f"File not found: {path}. {stderr or stdout}".strip()
+            )
+            return SSHCheck(check_name=check_name, passed=passed, details=details)
+
+        if probe_type == "file_contains":
+            path = str(probe.get("path", ""))
+            pattern = str(probe.get("pattern", ""))
+            cmd = (
+                f"grep -F -- {shlex.quote(pattern)} "
+                f"{shlex.quote(path)} >/dev/null 2>&1"
+            )
+            stdout, stderr, exit_code = await backend.run(session, cmd)
+            passed = exit_code == 0
+            details = (
+                f"File {path} contains expected pattern."
+                if passed
+                else f"Pattern not found in {path}. {stderr or stdout}".strip()
+            )
+            return SSHCheck(check_name=check_name, passed=passed, details=details)
+
+        if probe_type == "port_listening":
+            port = int(probe.get("port"))
+            cmd = (
+                "ss -tln | awk '{print $4}' | "
+                f"grep -E '(^|:){port}$' >/dev/null 2>&1"
+            )
+            stdout, stderr, exit_code = await backend.run(session, cmd)
+            passed = exit_code == 0
+            details = (
+                f"Port {port} is listening."
+                if passed
+                else f"Port {port} is not listening. {stderr or stdout}".strip()
+            )
+            return SSHCheck(check_name=check_name, passed=passed, details=details)
+
+        if probe_type == "http_body_contains":
+            path = str(probe.get("path", "/"))
+            pattern = str(probe.get("pattern", ""))
+            body, status_code, error = await self._fetch_http_probe(
+                target_ip=target_ip,
+                target_port=target_port,
+                path=path,
+            )
+            passed = error == "" and pattern in body
+            details = (
+                f"HTTP response contains expected pattern at {path}."
+                if passed
+                else f"HTTP response did not contain expected pattern at {path}. {error}".strip()
+            )
+            return SSHCheck(check_name=check_name, passed=passed, details=details)
+
+        if probe_type == "http_status":
+            path = str(probe.get("path", "/"))
+            expected_status = int(probe.get("status", 200))
+            _body, status_code, error = await self._fetch_http_probe(
+                target_ip=target_ip,
+                target_port=target_port,
+                path=path,
+            )
+            passed = error == "" and status_code == expected_status
+            details = (
+                f"HTTP status matched {expected_status} at {path}."
+                if passed
+                else (
+                    f"HTTP status did not match {expected_status} at {path}. "
+                    f"actual={status_code} {error}"
+                ).strip()
+            )
+            return SSHCheck(check_name=check_name, passed=passed, details=details)
+
+        return SSHCheck(
+            check_name=check_name,
+            passed=False,
+            details=f"Unsupported generated probe type: {probe_type}",
+        )
+
+    @staticmethod
+    async def _fetch_http_probe(
+        target_ip: str,
+        target_port: int,
+        path: str,
+    ) -> tuple[str, int, str]:
+        import httpx
+
+        if path.startswith("http://") or path.startswith("https://"):
+            url = path
+        else:
+            url = f"http://{target_ip}:{target_port}{path}"
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(url, follow_redirects=True)
+        except Exception as exc:
+            return "", 0, str(exc)
+
+        return response.text, response.status_code, ""

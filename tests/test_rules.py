@@ -418,6 +418,36 @@ class TestRuleEngine:
         assert result.passed is False
         assert result.score == 0.0
 
+    def test_engine_content_regex(self):
+        """content_regex: searches stdout/stderr with a regex."""
+        evidence = [
+            _EvidenceFactory.make_exp_execution(
+                stdout="uid=0(root) gid=0(root)",
+                stderr="",
+                exit_code=0,
+            ),
+        ]
+        rules = {
+            "checks": [
+                {
+                    "name": "id_output",
+                    "type": "content_regex",
+                    "params": {
+                        "patterns": [
+                            r"uid=[0-9]+\([^)]*\).*gid=[0-9]+\([^)]*\)"
+                        ]
+                    },
+                    "weight": 1.0,
+                },
+            ],
+            "logic": {"operator": "AND"},
+        }
+
+        result = self.engine.evaluate(evidence, rules)
+
+        assert result.passed is True
+        assert result.matched_rules == ["id_output"]
+
     # ------------------------------------------------------------------
     # Edge cases
     # ------------------------------------------------------------------

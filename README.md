@@ -73,7 +73,7 @@ The API will be available at `http://localhost:8000`. OpenAPI docs at `http://lo
 ```bash
 curl -X POST http://localhost:8000/submit \
   -F "exploit_file=@exp.py" \
-  -F "execute_cmd=python exp.py" \
+  -F "execute_cmd=python /exp/exploit" \
   -F "target_ip=192.168.1.10" \
   -F "target_port=22" \
   -F "verify_type=rce" \
@@ -111,13 +111,36 @@ curl http://localhost:8000/result/{task_id}
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `exploit_file` | file | Yes | Exploit file (.py, .jar, .go, .c, .cpp, .sh) |
-| `execute_cmd` | string | Yes | Execution command (e.g., `python exp.py`) |
+| `execute_cmd` | string | Yes | Execution command inside the sandbox (e.g., `python /exp/exploit`; use `auto` for C/C++ source uploads) |
 | `target_ip` | string | Yes | Target IP address |
 | `target_port` | integer | Yes | SSH port (usually 22) |
 | `verify_type` | string | Yes | `rce` / `info_leak` / `priv_esc` / `auth_bypass` |
 | `ssh_user` | string | Yes | SSH username |
 | `ssh_password` | string | No | SSH password |
 | `ssh_key` | string | No | SSH private key content |
+| `generate_rules_with_llm` | boolean | No | If `true`, ask the configured LLM to generate constrained verification rules before falling back to YAML rules |
+
+Uploaded files are copied into the runtime container as `/exp/exploit`.
+C and C++ source uploads are detected by extension and compiled inside
+the runtime container before execution:
+
+```bash
+curl -X POST http://localhost:8000/submit \
+  -F "exploit_file=@exp.c" \
+  -F "execute_cmd=auto" \
+  -F "target_ip=192.168.1.10" \
+  -F "target_port=22" \
+  -F "verify_type=rce" \
+  -F "ssh_user=root" \
+  -F "ssh_password=toor" \
+  -F "generate_rules_with_llm=true"
+```
+
+When LLM rule generation is enabled, model output is normalised into a
+limited set of checks such as `stdout_regex`, `file_exists`,
+`file_contains`, `port_listening`, `http_body_contains`, and `http_status`.
+The worker executes only these constrained probes; if generation fails,
+the task falls back to the existing YAML rules.
 
 ---
 
