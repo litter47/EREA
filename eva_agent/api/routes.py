@@ -203,4 +203,6 @@ def _detect_source_language(filename: str | None) -> str | None:
         return "c"
     if suffix in {".cc", ".cpp", ".cxx", ".c++"}:
         return "cpp"
+    if suffix == ".go":
+        return "go"
     return None

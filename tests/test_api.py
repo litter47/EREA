@@ -88,6 +88,37 @@ class TestSubmit:
         assert task.request["original_filename"] == "exploit.c"
         assert task.request["generate_rules_with_llm"] is True
 
+    @patch("builtins.open", new_callable=mock_open)
+    @patch("os.makedirs")
+    @patch("uuid.uuid4", return_value="mocked-task-uuid-go")
+    def test_submit_go_source_detection(
+        self, mock_uuid, mock_makedirs, mock_file, client, mock_task_manager
+    ):
+        """Go uploads are marked for automatic source compilation."""
+        response = client.post(
+            "/submit",
+            data={
+                "execute_cmd": "auto",
+                "target_ip": "192.168.1.100",
+                "target_port": 22,
+                "verify_type": "rce",
+                "ssh_user": "root",
+            },
+            files={
+                "exploit_file": (
+                    "exploit.go",
+                    b"package main\nfunc main() {}",
+                    "text/x-go",
+                )
+            },
+        )
+
+        assert response.status_code == 202
+        task = mock_task_manager.get("mocked-task-uuid-go")
+        assert task is not None
+        assert task.request["source_language"] == "go"
+        assert task.request["original_filename"] == "exploit.go"
+
     def test_submit_missing_fields(self, client):
         """Submit without required fields -> 422 validation error."""
         response = client.post(

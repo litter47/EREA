@@ -19,9 +19,17 @@ def test_cpp_source_build_command() -> None:
     )
 
 
+def test_go_source_build_command() -> None:
+    assert SandboxExecutor._build_command("go") == (
+        "cp /exp/exploit /exp/exploit.go && "
+        "go build -o /exp/exploit_bin /exp/exploit.go"
+    )
+
+
 def test_auto_run_command_for_source() -> None:
     assert SandboxExecutor._run_command("auto", "c") == "/exp/exploit_bin"
     assert SandboxExecutor._run_command("", "cpp") == "/exp/exploit_bin"
+    assert SandboxExecutor._run_command("auto", "go") == "/exp/exploit_bin"
 
 
 def test_explicit_run_command_preserved() -> None:

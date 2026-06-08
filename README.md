@@ -111,7 +111,7 @@ curl http://localhost:8000/result/{task_id}
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `exploit_file` | file | Yes | Exploit file (.py, .jar, .go, .c, .cpp, .sh) |
-| `execute_cmd` | string | Yes | Execution command inside the sandbox (e.g., `python /exp/exploit`; use `auto` for C/C++ source uploads) |
+| `execute_cmd` | string | Yes | Execution command inside the sandbox (e.g., `python /exp/exploit`; use `auto` for C/C++/Go source uploads) |
 | `target_ip` | string | Yes | Target IP address |
 | `target_port` | integer | Yes | SSH port (usually 22) |
 | `verify_type` | string | Yes | `rce` / `info_leak` / `priv_esc` / `auth_bypass` |
@@ -121,8 +121,8 @@ curl http://localhost:8000/result/{task_id}
 | `generate_rules_with_llm` | boolean | No | If `true`, ask the configured LLM to generate constrained verification rules before falling back to YAML rules |
 
 Uploaded files are copied into the runtime container as `/exp/exploit`.
-C and C++ source uploads are detected by extension and compiled inside
-the runtime container before execution:
+C, C++, and Go source uploads are detected by extension and compiled
+inside the runtime container before execution:
 
 ```bash
 curl -X POST http://localhost:8000/submit \

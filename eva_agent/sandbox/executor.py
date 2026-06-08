@@ -167,6 +167,7 @@ class SandboxExecutor:
                                     ),
                                     build_exit,
                                 )
+                            container.exec_run("chmod 755 /exp/exploit_bin")
                         result = container.exec_run(
                             full_command,
                             stdout=True,
@@ -263,13 +264,18 @@ class SandboxExecutor:
             return "gcc -x c /exp/exploit -o /exp/exploit_bin"
         if language in {"cpp", "c++"}:
             return "g++ -x c++ /exp/exploit -o /exp/exploit_bin"
+        if language == "go":
+            return (
+                "cp /exp/exploit /exp/exploit.go && "
+                "go build -o /exp/exploit_bin /exp/exploit.go"
+            )
         return None
 
     @staticmethod
     def _run_command(execute_cmd: str, source_language: str | None) -> str:
         """Choose the runtime command after optional source compilation."""
         command = (execute_cmd or "").strip()
-        if (source_language or "").lower() in {"c", "cpp", "c++"} and (
+        if (source_language or "").lower() in {"c", "cpp", "c++", "go"} and (
             not command or command.lower() == "auto"
         ):
             return "/exp/exploit_bin"
