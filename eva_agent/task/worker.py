@@ -317,12 +317,19 @@ class ExecutionWorker:
                     len(ssh_checks),
                 )
 
-            except Exception:
+            except Exception as exc:
                 logger.warning(
                     "Verification (backend=%s) failed for task %s:",
                     verify_backend,
                     task.id,
                     exc_info=True,
+                )
+                ssh_checks.append(
+                    SSHCheck(
+                        check_name="verification_error",
+                        passed=False,
+                        details=f"Verification failed: {exc}",
+                    )
                 )
             finally:
                 if session is not None:
@@ -387,6 +394,7 @@ class ExecutionWorker:
                 ssh_checks=ssh_checks,
                 llm_judgment=llm_judgment,
                 strict_rule_verdict=using_generated_rules,
+                verify_type=verify_type,
             )
 
             # ----------------------------------------------------------
@@ -443,6 +451,7 @@ class ExecutionWorker:
         ssh_checks: list[SSHCheck],
         llm_judgment: Optional[LLMJudgment],
         strict_rule_verdict: bool = False,
+        verify_type: str = "",
     ) -> str:
         """Determine the final verdict based on all pipeline results.
 
@@ -452,10 +461,12 @@ class ExecutionWorker:
            passed -> ``"SUCCESS"``
         3. Elif LLM judgment is available and says ``success`` ->
            ``"SUCCESS"``
-        4. Otherwise -> ``"FAIL"``
+        4. Elif auth-bypass EXP output shows success but secondary
+           verification failed due to network context -> ``"UNKNOWN"``
+        5. Otherwise -> ``"FAIL"``
 
         Returns:
-            One of ``"SUCCESS"`` or ``"FAIL"``.
+            One of ``"SUCCESS"``, ``"UNKNOWN"``, or ``"FAIL"``.
         """
         if rule_score is not None and rule_score.passed:
             logger.debug(
@@ -479,6 +490,17 @@ class ExecutionWorker:
             return "SUCCESS"
 
         if (
+            verify_type == "auth_bypass"
+            and ExecutionWorker._has_auth_bypass_exp_success(exp_result)
+            and ExecutionWorker._has_verification_network_error(ssh_checks)
+        ):
+            logger.debug(
+                "Verdict: UNKNOWN (EXP output indicates auth bypass, "
+                "but secondary verification hit a network error)"
+            )
+            return "UNKNOWN"
+
+        if (
             llm_judgment is not None
             and llm_judgment.success
         ):
@@ -490,6 +512,64 @@ class ExecutionWorker:
 
         logger.debug("Verdict: FAIL (no success condition met)")
         return "FAIL"
+
+    @staticmethod
+    def _has_auth_bypass_exp_success(
+        exp_result: Optional[ExpResult],
+    ) -> bool:
+        """Detect strong auth-bypass indicators in EXP stdout/stderr."""
+        if exp_result is None or exp_result.exit_code != 0:
+            return False
+
+        text = f"{exp_result.stdout}\n{exp_result.stderr}".lower()
+        status_ok_markers = (
+            "status: 200",
+            "http 200",
+            "http/1.1 200",
+            "http/1.0 200",
+        )
+        if not any(marker in text for marker in status_ok_markers):
+            return False
+
+        authenticated_indicators = (
+            "account info",
+            "<title>account info</title>",
+            "dashboard",
+            "admin panel",
+            "control panel",
+            "management",
+            "manager app",
+            "tomcat manager",
+            "logout",
+            "profile",
+            "user management",
+        )
+        return any(indicator in text for indicator in authenticated_indicators)
+
+    @staticmethod
+    def _has_verification_network_error(ssh_checks: list[SSHCheck]) -> bool:
+        """Return true when secondary verification failed due to reachability."""
+        network_error_markers = (
+            "all connection attempts failed",
+            "connection refused",
+            "connect call failed",
+            "connection reset",
+            "connection aborted",
+            "failed to establish a new connection",
+            "max retries exceeded",
+            "timed out",
+            "timeout",
+            "network is unreachable",
+            "no route to host",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "nodename nor servname",
+        )
+        for check in ssh_checks:
+            details = check.details.lower()
+            if any(marker in details for marker in network_error_markers):
+                return True
+        return False
 
     async def _generate_rules_with_llm(
         self,

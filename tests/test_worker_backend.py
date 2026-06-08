@@ -7,7 +7,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from eva_agent.config.settings import Settings
-from eva_agent.task.models import ExpResult, Task, TaskResult, TaskStatus
+from eva_agent.task.models import (
+    ExpResult,
+    LLMJudgment,
+    RuleScore,
+    SSHCheck,
+    Task,
+    TaskResult,
+    TaskStatus,
+)
 from eva_agent.task.worker import ExecutionWorker
 
 
@@ -290,3 +298,70 @@ class TestWorkerBackendRouting:
             assert task.result.final_verdict == "SUCCESS"
             assert task.result.rule_score is not None
             assert task.result.rule_score.matched_rules == ["marker_created"]
+
+    def test_auth_bypass_exp_success_network_error_is_unknown(self) -> None:
+        """EXP success evidence plus secondary network error is UNKNOWN."""
+        exp_result = ExpResult(
+            stdout=(
+                "[*] Requesting: http://127.0.0.1:8080/xxx/..;/admin/\n"
+                "[+] Status: 200\n"
+                "[+] Response body:\n<title>Account Info</title>"
+            ),
+            stderr="",
+            exit_code=0,
+            duration=0.2,
+        )
+        ssh_checks = [
+            SSHCheck(
+                check_name="access_protected",
+                passed=False,
+                details=(
+                    "HTTP error accessing http://127.0.0.1:8080/: "
+                    "All connection attempts failed"
+                ),
+            )
+        ]
+
+        verdict = ExecutionWorker._determine_verdict(
+            rule_score=RuleScore(
+                score=0.3,
+                passed=False,
+                matched_rules=["exp_exit_code_zero"],
+            ),
+            exp_result=exp_result,
+            ssh_checks=ssh_checks,
+            llm_judgment=LLMJudgment(
+                success=False,
+                confidence=0.9,
+                reasoning="secondary verification failed",
+            ),
+            verify_type="auth_bypass",
+        )
+
+        assert verdict == "UNKNOWN"
+
+    def test_auth_bypass_exp_failure_stays_fail(self) -> None:
+        """Network errors do not become UNKNOWN without EXP success evidence."""
+        exp_result = ExpResult(
+            stdout="some unrelated output",
+            stderr="",
+            exit_code=0,
+            duration=0.2,
+        )
+        ssh_checks = [
+            SSHCheck(
+                check_name="access_protected",
+                passed=False,
+                details="All connection attempts failed",
+            )
+        ]
+
+        verdict = ExecutionWorker._determine_verdict(
+            rule_score=None,
+            exp_result=exp_result,
+            ssh_checks=ssh_checks,
+            llm_judgment=None,
+            verify_type="auth_bypass",
+        )
+
+        assert verdict == "FAIL"
